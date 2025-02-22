@@ -50,7 +50,7 @@ def unpack_pq_codes(packed_codes, nbits, m):
 
 
 class IVFPQIndex:
-    def __init__(self, d=256, m=8, nbits=8, nlist=100, nprobe=10, reorder = False):
+    def __init__(self, d=256, m=8, nbits=8, nlist=100, nprobe=10, reorder_factor = 1):
         """
         d: 原始向量维度
         m: 子空间数量
@@ -64,7 +64,11 @@ class IVFPQIndex:
         self.k = 2 ** nbits  # 每个子空间的聚类中心数
         self.nlist = nlist
         self.nprobe = nprobe
-        self.reorder = reorder
+        self.data_store = None
+        self.reorder = False
+        self.reorder_factor = int(reorder_factor)
+        if self.reorder_factor > 1:
+            self.reorder = True
         
         self.residual = False
         self.index_flat = None
@@ -120,6 +124,7 @@ class IVFPQIndex:
         cluster_assignments = cluster_assignments.flatten()
 
         residuals = data - self.ivf_centroids[cluster_assignments]  # 计算残差
+        assert residuals.shape == data.shape
 
         # 训练 PQ（码表）使用残差数据
         self.pq.train(residuals)
@@ -145,9 +150,13 @@ class IVFPQIndex:
         distances, assignments = index_flat.search(data, 1)  # assignments shape: (N, 1)
 
         # PQ 编码（返回 uint8 数组，形状 (N, m)）
-        codes = self.pq.compute_codes(data).astype(np.uint8)
+        # 注意，编码时也要使用残差进行编码！！
+        if self.residual == True:
+            residuals = data - self.ivf_centroids[assignments.flatten()]  # 计算残差
+            codes = self.pq.compute_codes(residuals)  # 对残差进行编码
+        else:
+            codes = self.pq.compute_codes(data)
         # codes = unpack_pq_codes(codes, self.nbits, self.m)
-        print(f"Shape codes: {codes.shape}")
         codes = codes.reshape(-1, self.m)
         
         # 将每个数据点分配到对应簇的倒排列表中
@@ -156,6 +165,9 @@ class IVFPQIndex:
             self.invlists_ids[cluster].append(i)
         for i in range(self.nlist):
             print(f"cluster {i} has {len(self.invlists_ids[i])} vecs")
+            
+        if self.reorder == True:
+            self.data_store = data
 
     def search_adc(self, query, topk=10):
         """
@@ -165,7 +177,7 @@ class IVFPQIndex:
            对候选数据计算 ADC 距离（即：对每个子空间，取查询与码本中心距离，然后根据候选 PQ 码累加）
          - 返回候选数据的原始编号及其距离
         """
-        search_k = topk
+        search_k = topk * self.reorder_factor
         
         # 确保 query 是二维 (1, d)
         if query.ndim == 1:
@@ -208,7 +220,9 @@ class IVFPQIndex:
 
         # 选择 topk 最近的候选
         sorted_idx = np.argsort(adc_distances)
-        top_idx = sorted_idx[:topk]
+        top_idx = sorted_idx[:search_k]
+        if self.reorder:
+            return self.rerank(query, candidate_ids[top_idx], topk)
         return candidate_ids[top_idx], adc_distances[top_idx]
     
     def search_adc_residual(self, query, topk=10):
@@ -221,6 +235,7 @@ class IVFPQIndex:
          - 返回候选数据的原始编号及其距离
         """
         assert self.residual == True
+        search_k = topk * self.reorder_factor
         # 确保 query 是二维 (1, d)
         if query.ndim == 1:
             query = query.reshape(1, -1)
@@ -245,6 +260,7 @@ class IVFPQIndex:
         # 将查询向量转为 (m, dsub)
         q = query.flatten()  # (d,)
         distances = []
+        # 共享码表
         centroids = faiss.vector_to_array(self.pq.centroids).reshape(self.m, self.k, self.pq.dsub)
         for idx, cluster in enumerate(selected_clusters):
             q_residual = q - self.ivf_centroids[cluster]
@@ -256,6 +272,7 @@ class IVFPQIndex:
 
             # 对每个候选数据点，其 ADC 距离为：
             # distance = sum_{i=0}^{m-1} D_table[i, candidate_codes[c, i]]
+            # print(f"d_table: {D_table.shape}, candidate_codes: {candidate_codes_list[idx].shape}, arrange: {np.arange(self.m)[:, None].shape}")
             adc_distances = np.sum(D_table[np.arange(self.m)[:, None], candidate_codes_list[idx].T], axis=0)  # (N_candidates,)
             assert adc_distances.shape[0] == len(self.invlists_ids[cluster])
             distances.append(adc_distances)
@@ -266,7 +283,9 @@ class IVFPQIndex:
         distances = np.concatenate(distances, axis=0) # (N_candidates,)
         assert candidate_ids.shape[0] == distances.shape[0]
         sorted_idx = np.argsort(distances)
-        top_idx = sorted_idx[:topk]
+        top_idx = sorted_idx[:search_k]
+        if self.reorder:
+            return self.rerank(query, candidate_ids[top_idx], topk)
         return candidate_ids[top_idx], distances[top_idx]
 
     def search_sdc(self, query, topk=10):
@@ -276,6 +295,7 @@ class IVFPQIndex:
            再利用预计算的子量化器之间距离表计算距离。
          - 距离计算公式：distance = sum_{i=0}^{m-1} D_table[i, q_code[i], candidate_codes[c, i]]
         """
+        search_k = topk * self.reorder_factor
         # 确保 query 是二维 (1, d)
         if query.ndim == 1:
             query = query.reshape(1, -1)
@@ -322,7 +342,9 @@ class IVFPQIndex:
         # assert np.array_equal(sdc_distances, sdc_distances1)
 
         sorted_idx = np.argsort(sdc_distances)
-        top_idx = sorted_idx[:topk]
+        top_idx = sorted_idx[:search_k]
+        if self.reorder:
+            return self.rerank(query, candidate_ids[top_idx], topk)
         return candidate_ids[top_idx], sdc_distances[top_idx]
     
     def search_sdc_residual(self, query, topk=10):
@@ -332,6 +354,7 @@ class IVFPQIndex:
            再利用预计算的子量化器之间距离表计算距离。
          - 距离计算公式：distance = sum_{i=0}^{m-1} D_table[i, q_code[i], candidate_codes[c, i]]
         """
+        search_k = topk * self.reorder_factor
         assert self.residual == True
         # 确保 query 是二维 (1, d)
         if query.ndim == 1:
@@ -378,8 +401,30 @@ class IVFPQIndex:
         distances = np.concatenate(distances, axis=0)      # (N_candidates,)
         assert candidate_ids.shape[0] == distances.shape[0]
         sorted_idx = np.argsort(distances)
-        top_idx = sorted_idx[:topk]
+        top_idx = sorted_idx[:search_k]
+        if self.reorder:
+            return self.rerank(query, candidate_ids[top_idx], topk)
         return candidate_ids[top_idx], distances[top_idx]
+    
+    def rerank(self, query, candidate_ids, topK):
+        """
+        对候选ID进行精确重排序：
+        1. 根据候选ID获取原始向量
+        2. 计算查询与每个候选向量的L2距离
+        3. 按距离排序，返回排序后的ID和距离
+        """
+        # 确保query是二维数组
+        if query.ndim == 1:
+            query = query.reshape(1, -1)
+        # 获取候选向量
+        candidate_vectors = self.data_store[candidate_ids]
+        # 计算精确距离
+        distances = np.linalg.norm(candidate_vectors - query, axis=1) ** 2  # L2距离平方
+        # 排序
+        sorted_indices = np.argsort(distances)[:topK]
+        sorted_ids = candidate_ids[sorted_indices]
+        sorted_distances = distances[sorted_indices]
+        return sorted_ids, sorted_distances
     
 if __name__ == "__main__":
     
@@ -399,10 +444,11 @@ if __name__ == "__main__":
     nprobe = 4
     topK = ground_truth.shape[1]
     iter = 10
-    residual = True
+    residual = False
+    reorder_factor = 1
 
     # 构建并训练 IVF-PQ 索引
-    index = IVFPQIndex(d=d, m=m, nbits=nbits, nlist=nlist, nprobe=nprobe)
+    index = IVFPQIndex(d=d, m=m, nbits=nbits, nlist=nlist, nprobe=nprobe, reorder_factor=reorder_factor)
     if residual: 
         index.train_residual(base_vec)
     else:
