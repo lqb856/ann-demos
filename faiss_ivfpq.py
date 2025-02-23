@@ -81,6 +81,7 @@ class BaseANN(object):
     def __str__(self) -> str:
         return self.name
 
+
 class Faiss(BaseANN):
     def query(self, v, n):
         D, I = self.index.search(numpy.expand_dims(v, axis=0).astype(numpy.float32), n)
@@ -99,6 +100,7 @@ class Faiss(BaseANN):
                     r.append(l)
             res.append(r)
         return res
+
 
 class FaissIVFPQfs(Faiss):
     def __init__(self, n_list):
@@ -135,6 +137,65 @@ class FaissIVFPQfs(Faiss):
     def __str__(self):
         return "FaissIVFPQfs(n_list=%d, n_probe=%d, k_reorder=%d)" % (self._n_list, self._n_probe, self._k_reorder)
 
+
+class FaissNSG(Faiss):  # 继承自已有的 Faiss 基类
+    def __init__(self, R: int = 32, build_type: int = 0):
+        """
+        初始化 NSG 索引参数
+        Args:
+            R (int): 构建图时每个节点的邻居数（控制图的连通性）
+            build_type (int): 图构建算法类型（0=FAISS默认，1=更精确但更慢）
+        """
+        self._R = R
+        self._build_type = build_type
+        self._search_L = 40  # 默认搜索参数
+        self.index = None  # 实际索引对象
+
+    def fit(self, X: numpy.array) -> None:
+        """
+        构建 NSG 索引并添加数据
+        Args:
+            X (numpy.array): 训练数据，形状为 [n_samples, n_features]
+        """
+        if X.dtype != numpy.float32:
+            X = X.astype(numpy.float32)
+
+        d = X.shape[1]
+        self.index = faiss.IndexNSGFlat(d, self._R)  # 初始化 NSG 索引
+
+        # 配置图构建参数
+        self.index.nsg.build_type = self._build_type  # 0=默认构建，1=更精确
+
+        # 若需要数据归一化（例如使用余弦相似度时）
+        # faiss.normalize_L2(X)
+
+        # NSG 通常无需显式训练，直接添加数据
+        self.index.add(X)
+
+    def set_query_arguments(self, search_L: int, search_type: int = 0):
+        """
+        设置查询参数
+        Args:
+            search_L (int): 搜索时访问的节点数（越大召回率越高，但越慢）
+            search_type (int): 搜索类型（0=双向搜索，1=单向搜索）
+        """
+        self._search_L = search_L
+        self.index.nsg.search_L = self._search_L
+        self.index.nsg.search_type = search_type
+
+    def get_additional(self) -> Dict[str, Any]:
+        """
+        返回额外的统计信息（例如距离计算次数）
+        """
+        return {
+            "search_L": self._search_L,
+            "build_type": self._build_type,
+            "R": self._R
+        }
+
+    def __str__(self) -> str:
+        return f"FaissNSG(R={self._R}, build_type={self._build_type}, search_L={self._search_L})"
+
 if __name__ == "__main__":
     
     # 加载数据集
@@ -155,29 +216,44 @@ if __name__ == "__main__":
     nlist = 16
     nprobe = 4
     topK = ground_truth.shape[1]
+    reorder_factor = 0
     iter = 10
     
+    # NSG
+    neighbor_num = 32
+    build_type = 0 # 0=默认构建（暴力搜索），1=NNDescent 算法构建
+    search_L = 3 # 搜索时访问的节点数（越大召回率越高，但越慢）
+    search_type = 0 # 0=双向搜索，1=单向搜索
+    
+    
     # 创建IVFPQ索引
-    quantizer = faiss.IndexFlatL2(d)
-    index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
+    # 1. 使用原始的 IVFPQ
+    # quantizer = faiss.IndexFlatL2(d)
+    # index = faiss.IndexIVFPQ(quantizer, d, nlist, m, nbits)
+    # # 训练并添加数据
+    # index.train(base_vec)
+    # index.add(base_vec)
     
+    # 2. 使用 Faiss 的工厂方法创建 IVFPQ
     # index = FaissIVFPQfs(nlist)
-    
-    # 训练并添加数据
-    index.train(base_vec)
-    index.add(base_vec)
+    # 训练索引
     # index.fit(base_vec)
-    # index.set_query_arguments(nprobe, 0)
+    # index.set_query_arguments(nprobe, reorder_factor)
+    
+    # 3. 使用 NSG
+    index = FaissNSG(neighbor_num, build_type)
+    index.fit(base_vec)
+    index.set_query_arguments(search_L=search_L, search_type=search_type)
     
     avg_recall = 0.0
     for id, query in enumerate(query_vec[:iter]):
         true_top_id = ground_truth[id]
-        query = query.reshape(1, -1)
-        distances, indices = index.search(query, k=topK)
-        # indices = index.query(query, topK)
+        # query = query.reshape(1, -1)
+        # distances, indices = index.search(query, k=topK)
+        indices = index.query(query, topK)
         recall = len(np.intersect1d(true_top_id, indices)) / topK
         avg_recall += recall
-        print(f"Faiss ADC Recall@{topK}: {recall:.3f}")
+        print(f"{index} Recall@{topK}: {recall:.3f}")
     
     print(f"avg recall: {avg_recall / iter:.3f}")
     
