@@ -1,5 +1,5 @@
 import faiss
-from dataloader import *
+from python.dataloader import *
 
 from multiprocessing.pool import ThreadPool
 from typing import Any, Dict, Optional

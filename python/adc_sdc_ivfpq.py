@@ -1,7 +1,7 @@
 import numpy as np
 import faiss
 
-from dataloader import *
+from python.dataloader import *
 
 def unpack_pq_codes(packed_codes, nbits, m):
     """
