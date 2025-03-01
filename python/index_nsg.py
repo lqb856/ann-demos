@@ -21,6 +21,7 @@ class NSGIndex:
         """
         self.data = data
         self.knn_k = knn_k
+        self.mst = mst
         if self.knn_k < max_neighbors:
             self.knn_k = max_neighbors + 1
         self.max_neighbors = max_neighbors
@@ -162,7 +163,7 @@ class NSGIndex:
                 existing.add(node)
                 if len(beam) >= beam_width:
                     break
-        print(f"enterpoint: {beam}")
+        # print(f"enterpoint: {beam}")
         while beam:
             current_dist, current_node, hops = beam.pop(0)
             self._add_to_beam(res, (current_dist, current_node), topK)
@@ -208,7 +209,7 @@ class NSGIndex:
             beam.pop()  # 移除距离最大的元素
             
     def __str__(self):
-        return f"NSGIndex"
+        return f"NSGIndex(knn_k={self.knn_k}, mst={self.mst}, num_neighbour={self.max_neighbors})"
             
 if __name__ == "__main__":
     
@@ -224,23 +225,28 @@ if __name__ == "__main__":
     print(ground_truth.shape)
     
     topK = ground_truth.shape[1]
-    max_hops = 10
-    enterpoints = "auto"
+    max_hops = 4
+    enterpoints = "enter"
     beam_width = 100
     knn_k = 32
     max_neighbors = 3
-    iter = 1
+    iter = 100
+    sample_size = int(topK * 0.3)
     
-    nsg = NSGIndex(base_vec[:1000], knn_k=knn_k, mst=True, max_neighbors=max_neighbors)
+    nsg = NSGIndex(base_vec[:10000], knn_k=knn_k, mst=False, max_neighbors=max_neighbors)
 
     avg_recall = 0.0
     for id, query in enumerate(query_vec[:iter]):
         # true_top_id = ground_truth[id]
-        distances = np.linalg.norm(base_vec[:1000] - query, axis=1)
+        distances = np.linalg.norm(base_vec[:10000] - query, axis=1)
         true_top_id = np.argsort(distances)[:topK]
-        print(f"true id: {true_top_id}")
-        distances, indices = nsg.search(query, enterpoints=enterpoints, max_hops=max_hops, topK=topK, beam_width=beam_width)
-        print(f"nsg id: {indices}")
+        random_sample = np.random.choice(true_top_id, size=sample_size, replace=False)
+        # print(f"true id: {true_top_id}")
+        if enterpoints == "auto":
+            distances, indices = nsg.search(query, enterpoints="auto", max_hops=max_hops, topK=topK, beam_width=beam_width)
+        else:
+            distances, indices = nsg.search(query, enterpoints=random_sample, max_hops=max_hops, topK=topK, beam_width=beam_width)
+        # print(f"nsg id: {indices}")
         recall = len(np.intersect1d(true_top_id, indices)) / topK
         avg_recall += recall
         print(f"{nsg} Recall@{topK}: {recall:.3f}")
