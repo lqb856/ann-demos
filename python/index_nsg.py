@@ -2,6 +2,9 @@ import heapq
 import numpy as np
 from collections import defaultdict
 
+import fast_knn
+from dataloader import *
+
 def euclidean_distance(a, b):
     return np.sqrt(np.sum((a - b)**2))
 
@@ -18,6 +21,8 @@ class NSGIndex:
         """
         self.data = data
         self.knn_k = knn_k
+        if self.knn_k < max_neighbors:
+            self.knn_k = max_neighbors + 1
         self.max_neighbors = max_neighbors
         self.neighbors = self._build_graph(mst)
     
@@ -36,17 +41,18 @@ class NSGIndex:
 
     def _build_knn_graph(self):
         """暴力搜索构建KNN图"""
-        n = len(self.data)
-        graph = [[] for _ in range(n)]
+        # n = len(self.data)
+        # graph = [[] for _ in range(n)]
         
-        for i in range(n):
-            distances = []
-            for j in range(n):
-                if i != j:
-                    dist = euclidean_distance(self.data[i], self.data[j])
-                    distances.append((dist, j))
-            distances.sort()
-            graph[i] = [j for _, j in distances[:self.knn_k]]
+        # for i in range(n):
+        #     distances = []
+        #     for j in range(n):
+        #         if i != j:
+        #             dist = euclidean_distance(self.data[i], self.data[j])
+        #             distances.append((dist, j))
+        #     distances.sort()
+        #     graph[i] = [j for _, j in distances[:self.knn_k]]
+        graph = fast_knn.build_knn_graph(self.data, knn_k, 32)
         return graph
 
     def _build_mst(self):
@@ -122,18 +128,44 @@ class NSGIndex:
         """
         beam_width = max(beam_width, topK)
         beam = []
+        res = []
         visited = {}
         
-        # 初始化入口点（支持单/多入口）
-        enterpoints = [enterpoints] if isinstance(enterpoints, int) else enterpoints
+        # 处理自动初始化模式
+        if enterpoints == "auto":
+            enterpoints = np.random.choice(len(self.data), beam_width, replace=False).tolist()
+        else:
+            # 转换单入口点为列表
+            enterpoints = [enterpoints] if isinstance(enterpoints, int) else enterpoints
+            
+        # 第一阶段：添加用户指定入口点
+        existing = set()
         for ep in enterpoints:
-            dist = euclidean_distance(query_vec, self.data[ep])
-            self._add_to_beam(beam, (dist, ep, 0), beam_width)
-            visited[ep] = (dist, 0)
+            if ep not in existing and ep < len(self.data):
+                dist = euclidean_distance(query_vec, self.data[ep])
+                self._add_to_beam(beam, (dist, ep, 0), beam_width)
+                visited[ep] = (dist, 0)
+                existing.add(ep)
         
+        # 第二阶段：补充随机入口点
+        remain = beam_width - len(beam)
+        if remain > 0:
+            candidates = np.random.choice(len(self.data), remain + 10, replace=False)  # 多采样防重复
+            for node in candidates:
+                if node in existing:
+                    continue
+                if node >= len(self.data):  # 防止越界
+                    continue
+                dist = euclidean_distance(query_vec, self.data[node])
+                self._add_to_beam(beam, (dist, node, 0), beam_width)
+                visited[node] = (dist, 0)
+                existing.add(node)
+                if len(beam) >= beam_width:
+                    break
+        print(f"enterpoint: {beam}")
         while beam:
             current_dist, current_node, hops = beam.pop(0)
-            
+            self._add_to_beam(res, (current_dist, current_node), topK)
             if hops >= max_hops:
                 continue
                 
@@ -153,7 +185,7 @@ class NSGIndex:
                     self._add_to_beam(beam, (neighbor_dist, neighbor, new_hops), beam_width)
         
         # 直接返回前topK个（beam已有序）
-        return [dis for dis, _, _ in beam[:topK]], [node for _, node, _ in beam[:topK]]
+        return [dis for dis, _ in res], [node for _, node in res]
 
     def _add_to_beam(self, beam, element, max_size):
         """
@@ -174,3 +206,45 @@ class NSGIndex:
         # 控制队列长度
         if len(beam) > max_size:
             beam.pop()  # 移除距离最大的元素
+            
+    def __str__(self):
+        return f"NSGIndex"
+            
+if __name__ == "__main__":
+    
+    # 加载数据集
+    base_vec = read_fvecs("/home/lqb/ann-dataset/SIFT1M/sift_base.fvecs")
+    base_vec = np.ascontiguousarray(base_vec)
+    print(base_vec.shape)
+    query_vec = read_fvecs("/home/lqb/ann-dataset/SIFT1M/sift_query.fvecs")
+    query_vec = np.ascontiguousarray(query_vec)
+    print(query_vec.shape)
+    ground_truth = read_ivecs_variable_k("/home/lqb/ann-dataset/SIFT1M/sift_groundtruth.ivecs")
+    ground_truth = np.ascontiguousarray(ground_truth)
+    print(ground_truth.shape)
+    
+    topK = ground_truth.shape[1]
+    max_hops = 10
+    enterpoints = "auto"
+    beam_width = 100
+    knn_k = 32
+    max_neighbors = 3
+    iter = 1
+    
+    nsg = NSGIndex(base_vec[:1000], knn_k=knn_k, mst=True, max_neighbors=max_neighbors)
+
+    avg_recall = 0.0
+    for id, query in enumerate(query_vec[:iter]):
+        # true_top_id = ground_truth[id]
+        distances = np.linalg.norm(base_vec[:1000] - query, axis=1)
+        true_top_id = np.argsort(distances)[:topK]
+        print(f"true id: {true_top_id}")
+        distances, indices = nsg.search(query, enterpoints=enterpoints, max_hops=max_hops, topK=topK, beam_width=beam_width)
+        print(f"nsg id: {indices}")
+        recall = len(np.intersect1d(true_top_id, indices)) / topK
+        avg_recall += recall
+        print(f"{nsg} Recall@{topK}: {recall:.3f}")
+    
+    print(f"avg recall: {avg_recall / iter:.3f}")
+    
+    
