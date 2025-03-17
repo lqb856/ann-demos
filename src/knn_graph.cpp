@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <omp.h>
 
+#include <ittnotify.h>
+
 namespace py = pybind11;
 
 using MatrixXd = py::array_t<float, py::array::c_style | py::array::forcecast>;
@@ -84,6 +86,26 @@ py::list build_knn_graph(const MatrixXd &data, int knn_k, int n_threads = -1) {
   return py_graph;
 }
 
+
+
+
+// 封装 ITT API 的暂停和恢复采样功能
+void itt_pause() { __itt_pause(); }
+
+void itt_resume() { __itt_resume(); }
+
+// 让 VTune 在模块加载时自动暂停采样
+struct ITTController {
+  ITTController() {
+    __itt_pause(); // 加载模块时暂停 VTune 采样
+  }
+};
+
+
 PYBIND11_MODULE(fast_knn, m) {
   m.def("build_knn_graph", &build_knn_graph, py::arg("data"), py::arg("knn_k"), py::arg("n_threads") = -1);
+
+  static ITTController controller; // 模块初始化时自动暂停采样
+  m.def("pause", &itt_pause, "Pause VTune sampling");
+  m.def("resume", &itt_resume, "Resume VTune sampling");
 }

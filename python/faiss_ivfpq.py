@@ -1,11 +1,13 @@
 import faiss
-from python.dataloader import *
+from dataloader import *
 
 from multiprocessing.pool import ThreadPool
 from typing import Any, Dict, Optional
 import psutil
 
 import numpy
+
+import fast_knn
 
 class BaseANN(object):
     """Base class/interface for Approximate Nearest Neighbors (ANN) algorithms used in benchmarking."""
@@ -101,6 +103,32 @@ class Faiss(BaseANN):
             res.append(r)
         return res
 
+
+class FaissIVF(Faiss):
+    def __init__(self, metric, n_list):
+        self._n_list = n_list
+        self._metric = metric
+
+    def fit(self, X):
+        if X.dtype != numpy.float32:
+            X = X.astype(numpy.float32)
+
+        self.quantizer = faiss.IndexFlatL2(X.shape[1])
+        index = faiss.IndexIVFFlat(self.quantizer, X.shape[1], self._n_list, faiss.METRIC_L2)
+        index.train(X)
+        index.add(X)
+        self.index = index
+
+    def set_query_arguments(self, n_probe):
+        faiss.cvar.indexIVF_stats.reset()
+        self._n_probe = n_probe
+        self.index.nprobe = self._n_probe
+
+    def get_additional(self):
+        return {"dist_comps": faiss.cvar.indexIVF_stats.ndis + faiss.cvar.indexIVF_stats.nq * self._n_list}  # noqa
+
+    def __str__(self):
+        return "FaissIVF(n_list=%d, n_probe=%d)" % (self._n_list, self._n_probe)
 
 class FaissIVFPQfs(Faiss):
     def __init__(self, n_list):
@@ -199,25 +227,30 @@ class FaissNSG(Faiss):  # 继承自已有的 Faiss 基类
 if __name__ == "__main__":
     
     # 加载数据集
-    base_vec = read_fvecs("/home/lqb/ann-dataset/SIFT1M/sift_base.fvecs")
+    # base_vec = read_fvecs("/home/lqb/ann-dataset/SIFT1M/sift_base.fvecs")
+    base_vec = read_fbin("/home/lqb/ann-dataset/DEEP10M/base.fbin")
     base_vec = np.ascontiguousarray(base_vec)
     print(base_vec.shape)
-    query_vec = read_fvecs("/home/lqb/ann-dataset/SIFT1M/sift_query.fvecs")
+    # query_vec = read_fvecs("/home/lqb/ann-dataset/SIFT1M/sift_query.fvecs")
+    query_vec = read_fbin("/home/lqb/ann-dataset/DEEP10M/query.fbin")
     query_vec = np.ascontiguousarray(query_vec)
     print(query_vec.shape)
-    ground_truth = read_ivecs_variable_k("/home/lqb/ann-dataset/SIFT1M/sift_groundtruth.ivecs")
-    ground_truth = np.ascontiguousarray(ground_truth)
-    print(ground_truth.shape)
+    # ground_truth = read_ivecs_variable_k("/home/lqb/ann-dataset/SIFT1M/sift_groundtruth.ivecs")
+    # ground_truth = np.ascontiguousarray(ground_truth)
+    # print(ground_truth.shape)
     
     # 参数设定
     d = base_vec.shape[1]
-    m = 32
+    m = 96
     nbits = 8
-    nlist = 16
-    nprobe = 4
-    topK = ground_truth.shape[1]
+    nlist = 200
+    nprobe = 10
+    # topK = ground_truth.shape[1]
+    topK = 100
     reorder_factor = 0
-    iter = 10
+    iter = 10000
+    
+    batch_size = 10
     
     # NSG
     neighbor_num = 32
@@ -235,25 +268,37 @@ if __name__ == "__main__":
     # index.add(base_vec)
     
     # 2. 使用 Faiss 的工厂方法创建 IVFPQ
-    # index = FaissIVFPQfs(nlist)
+    index = FaissIVFPQfs(nlist)
     # 训练索引
-    # index.fit(base_vec)
-    # index.set_query_arguments(nprobe, reorder_factor)
+    index.fit(base_vec)
+    index.set_query_arguments(nprobe, reorder_factor)
     
     # 3. 使用 NSG
-    index = FaissNSG(neighbor_num, build_type)
-    index.fit(base_vec)
-    index.set_query_arguments(search_L=search_L, search_type=search_type)
+    # index = FaissNSG(neighbor_num, build_type)
+    # index.fit(base_vec)
+    # index.set_query_arguments(search_L=search_L, search_type=search_type)
     
     avg_recall = 0.0
-    for id, query in enumerate(query_vec[:iter]):
-        true_top_id = ground_truth[id]
+    fast_knn.resume()
+    
+    # for id, query in enumerate(query_vec):
+    #     # true_top_id = ground_truth[id]
+    #     # query = query.reshape(1, -1)
+    #     # distances, indices = index.search(query, k=topK)
+    #     # indices = index.query(query, topK)
+    #     # recall = len(np.intersect1d(true_top_id, indices)) / topK
+    #     # avg_recall += recall
+    #     # print(f"{index} Recall@{topK}: {recall:.3f}")
+    
+    for i in range(0, len(query_vec), batch_size):
+        # true_top_id = ground_truth[id]
         # query = query.reshape(1, -1)
         # distances, indices = index.search(query, k=topK)
-        indices = index.query(query, topK)
-        recall = len(np.intersect1d(true_top_id, indices)) / topK
-        avg_recall += recall
-        print(f"{index} Recall@{topK}: {recall:.3f}")
+        batch_queries = query_vec[i : i + batch_size]
+        indices = index.batch_query(batch_queries, topK)
+        # recall = len(np.intersect1d(true_top_id, indices)) / topK
+        # avg_recall += recall
+        # print(f"{index} Recall@{topK}: {recall:.3f}")
     
-    print(f"avg recall: {avg_recall / iter:.3f}")
+    print(f"avg recall@{topK}-{len(query_vec)}: {avg_recall / iter:.3f}")
     

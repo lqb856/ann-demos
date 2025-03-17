@@ -37,11 +37,13 @@ def read_fbin(file_path):
         # 读取维度（头部的 int32）
         dim = np.fromfile(f, dtype=np.int32, count=1)[0]
         
+        print(f"dim={dim}")
+        
         # 读取剩余数据（全部为 float32）
-        data = np.fromfile(f, dtype=np.float32)
+        data = np.fromfile(f, dtype=np.float32)[1:]
         
         # 转换为 (N, dim) 矩阵
-        data = data.reshape(-1, dim)
+        data = data.reshape(dim, -1)
         return data
     
 def read_ivecs(filename):
